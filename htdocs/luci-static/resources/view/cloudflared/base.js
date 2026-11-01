@@ -72,6 +72,22 @@ return view.extend({
 		o = s.option(form.DynamicList, 'token', _('Token'));
 		o.rmempty = false;
 
+		o = s.option(form.ListValue, 'region', _('Region'),
+			_('The region to which connections are established.'));
+		o.value('', _('Auto (Nearest - Recommended)'));
+		o.value('us', _('United States'));
+		o.default = '';
+		o.optional = true;
+
+		o = s.option(form.ListValue, 'loglevel', _('Logging level'));
+		o.value('fatal', _('Fatal'));
+		o.value('error', _('Error'));
+		o.value('warn', _('Warning'));
+		o.value('info', _('Info'));
+		o.value('debug', _('Debug'));
+		o.default = 'info';
+		o.optional = true;
+
 		o = s.option(form.Button, '_panel', _('Cloudflare Zero Trust'),
 			_('Create or manage your cloudflared network.'));
 		o.inputtitle = _('Open website');

@@ -1,15 +1,72 @@
 {
-	"luci-app-cloudflared": {
-		"description": "Grant access to Cloudflared configuration",
-		"read": {
-			"file": [ "/var/log/cloudflared.log" ],
-			"ubus": {
-				"service": [ "list" ]
-			},
-			"uci": [ "cloudflared" ]
-		},
-		"write": {
-			"uci": [ "cloudflared" ]
-		}
-	}
+  "luci-app-cloudflared": {
+    "description": "Grant access to Cloudflared configuration",
+    "read": {
+      "uci": [
+        "cloudflared"
+      ],
+      "ubus": {
+        "service": [
+          "list"
+        ],
+        "luci.cloudflared": [
+          "getTunnels",
+          "startTunnel",
+          "stopTunnel",
+          "restartTunnel",
+          "activateTunnel",
+          "createTunnel",
+          "addExistingTunnel",
+          "editTunnel",
+          "deleteTunnel",
+          "addIngressRule",
+          "editIngressRule",
+          "deleteIngressRule",
+          "toggleIngressRule",
+          "getTunnelLogs",
+          "testRouteReachability"
+        ]
+      },
+      "file": {
+        "/etc/cloudflared/*": [
+          "read"
+        ],
+        "/var/log/cloudflared.log": [
+          "read"
+        ]
+      }
+    },
+    "write": {
+      "uci": [
+        "cloudflared"
+      ],
+      "ubus": {
+        "luci.cloudflared": [
+          "getTunnels",
+          "startTunnel",
+          "stopTunnel",
+          "restartTunnel",
+          "activateTunnel",
+          "createTunnel",
+          "addExistingTunnel",
+          "editTunnel",
+          "deleteTunnel",
+          "addIngressRule",
+          "editIngressRule",
+          "deleteIngressRule",
+          "toggleIngressRule",
+          "getTunnelLogs",
+          "testRouteReachability"
+        ]
+      },
+      "file": {
+        "/etc/cloudflared/*": [
+          "write"
+        ],
+        "/usr/bin/cloudflared *": [
+          "exec"
+        ]
+      }
+    }
+  }
 }

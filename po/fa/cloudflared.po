@@ -1,0 +1,80 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "Cloudflared"
+msgstr "کلودفلرد"
+
+msgid "Cloudflare Zero Trust Tunnel"
+msgstr "تانل کلودفلر زیرو تراست"
+
+msgid "Zero Trust Security services from Cloudflare to help you get maximum security both from outside and within the network."
+msgstr "سرویس‌های امنیتی زیرو تراست کلودفلر جهت تأمین بالاترین سطح دسترسی امن از خارج و داخل شبکه."
+
+msgid "Configuration"
+msgstr "پیکربندی"
+
+msgid "Base settings"
+msgstr "تنظیمات پایه"
+
+msgid "Tunnels"
+msgstr "تانل‌ها"
+
+msgid "Log"
+msgstr "گزارش‌ها"
+
+msgid "Status"
+msgstr "وضعیت"
+
+msgid "Running"
+msgstr "در حال اجرا"
+
+msgid "Not Running"
+msgstr "متوقف شده"
+
+msgid "Enable"
+msgstr "فعال‌سازی"
+
+msgid "Token"
+msgstr "توکن تانل"
+
+msgid "The tunnel token is shown in the dashboard once you create a tunnel."
+msgstr "توکن تانل پس از ساخت تانل در داشبورد کلودفلر نمایش داده می‌شود."
+
+msgid "Region"
+msgstr "منطقه اتصال (Region)"
+
+msgid "The region to which connections are established."
+msgstr "منطقه‌ای که اتصالات اج کلودفلر به آن برقرار می‌شود."
+
+msgid "Auto (Nearest - Recommended)"
+msgstr "خودکار (نزدیک‌ترین - پیشنهادی)"
+
+msgid "United States"
+msgstr "ایالات متحده آمریکا"
+
+msgid "Logging level"
+msgstr "سطح لاگ"
+
+msgid "Fatal"
+msgstr "بحرانی (Fatal)"
+
+msgid "Error"
+msgstr "خطا (Error)"
+
+msgid "Warning"
+msgstr "هشدار (Warning)"
+
+msgid "Info"
+msgstr "اطلاعات (Info)"
+
+msgid "Debug"
+msgstr "دیباگ (Debug)"
+
+msgid "Cloudflare Zero Trust"
+msgstr "کلودفلر زیرو تراست"
+
+msgid "Create or manage your cloudflared network."
+msgstr "ایجاد یا مدیریت شبکه کلودفلرد."
+
+msgid "Open website"
+msgstr "باز کردن وب‌سایت"

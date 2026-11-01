@@ -5,13 +5,13 @@
 include $(TOPDIR)/rules.mk
 
 LUCI_TITLE:=LuCI for Cloudflared
-LUCI_DEPENDS:=+cloudflared
+LUCI_DEPENDS:=+cloudflared +ucode +ucode-mod-fs +ucode-mod-uci +curl
 LUCI_PKGARCH:=all
-LUCI_DESCRIPTION:=LuCI support for Cloudflared
+LUCI_DESCRIPTION:=LuCI support for Cloudflared Zero Trust Tunnels
 
 PKG_MAINTAINER:=Hilman Maulana <hilman0.0maulana@gmail.com>
 PKG_NAME:=luci-app-cloudflared
-PKG_VERSION:=2.0.1-20240113
+PKG_VERSION:=2.1.0
 
 include $(TOPDIR)/feeds/luci/luci.mk
 
