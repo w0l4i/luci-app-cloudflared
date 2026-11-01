@@ -1,0 +1,839 @@
+#!/usr/bin/ucode
+'use strict';
+import * as fs from 'fs';
+import * as uci from 'uci';
+
+let action = ARGV[0];
+let method = ARGV[1];
+
+let cursor = uci.cursor();
+let account_id = cursor.get('cloudflared', 'config', 'account_id') || '';
+let api_token = cursor.get('cloudflared', 'config', 'api_token') || '';
+let zone_id = cursor.get('cloudflared', 'config', 'zone_id') || '';
+let active_tunnel_id = cursor.get('cloudflared', 'config', 'active_tunnel') || '';
+let current_token = cursor.get('cloudflared', 'config', 'token') || '';
+
+function run_cmd(cmd) {
+    let p = fs.popen(cmd);
+    if (!p) return '';
+    let out = p.read('all');
+    p.close();
+    return out || '';
+}
+
+function cf_api(path, http_method, payload) {
+    if (!api_token || !account_id) return null;
+    let url = 'https://api.cloudflare.com/client/v4/accounts/' + account_id + path;
+    let cmd = "curl -s -m 8 -X " + (http_method || 'GET') + " '" + url + "' " +
+              "-H 'Authorization: Bearer " + api_token + "' " +
+              "-H 'Content-Type: application/json'";
+    if (payload) {
+        let json_str = sprintf('%J', payload);
+        let escaped = replace(json_str, "'", "'\\''");
+        cmd += " -d '" + escaped + "'";
+    }
+    let res = run_cmd(cmd);
+    return json(res);
+}
+
+function cf_zone_api(path, http_method, payload) {
+    if (!api_token || !zone_id) return null;
+    let url = 'https://api.cloudflare.com/client/v4/zones/' + zone_id + path;
+    let cmd = "curl -s -m 8 -X " + (http_method || 'GET') + " '" + url + "' " +
+              "-H 'Authorization: Bearer " + api_token + "' " +
+              "-H 'Content-Type: application/json'";
+    if (payload) {
+        let json_str = sprintf('%J', payload);
+        let escaped = replace(json_str, "'", "'\\''");
+        cmd += " -d '" + escaped + "'";
+    }
+    let res = run_cmd(cmd);
+    return json(res);
+}
+
+function is_service_running() {
+    let out = run_cmd("/etc/init.d/cloudflared status 2>/dev/null");
+    if (index(out, 'running') >= 0) return true;
+    let ps = run_cmd("pgrep -f 'cloudflared.*run' 2>/dev/null");
+    return length(trim(ps)) > 0;
+}
+
+function get_recent_connections() {
+    let log = run_cmd("tail -n 60 /var/log/cloudflared.log 2>/dev/null");
+    let lines = split(log, '\n');
+    let conns = [];
+    for (let l in lines) {
+        if (index(l, 'Registered tunnel connection') >= 0) {
+            let m_conn = match(l, /connIndex=([0-9]+)/);
+            let m_ip = match(l, /ip=([0-9.]+)/);
+            let m_loc = match(l, /location=([a-zA-Z0-9]+)/);
+            let m_proto = match(l, /protocol=([a-zA-Z0-9]+)/);
+            push(conns, {
+                index: m_conn ? m_conn[1] : '',
+                origin_ip: m_ip ? m_ip[1] : '',
+                colo_name: m_loc ? m_loc[1] : '',
+                protocol: m_proto ? m_proto[1] : 'quic'
+            });
+        }
+    }
+    return conns;
+}
+
+function decode_token(tok) {
+    if (!tok) return null;
+    try {
+        let raw = b64dec(trim(tok));
+        return json(raw);
+    } catch(e) {
+        return null;
+    }
+}
+
+function delete_dns_cname(hostname) {
+    if (!hostname || !api_token || !zone_id) return;
+    let dns_res = cf_zone_api('/dns_records?name=' + hostname, 'GET', null);
+    if (dns_res && dns_res.success && dns_res.result) {
+        for (let rec in dns_res.result) {
+            cf_zone_api('/dns_records/' + rec.id, 'DELETE', null);
+        }
+    }
+}
+
+function create_or_update_dns_cname(hostname, tun_id) {
+    if (!hostname || !tun_id || !api_token || !zone_id) return;
+    let target = tun_id + '.cfargotunnel.com';
+    let dns_res = cf_zone_api('/dns_records?name=' + hostname, 'GET', null);
+    if (dns_res && dns_res.success && dns_res.result && length(dns_res.result) > 0) {
+        let rec = dns_res.result[0];
+        if (rec.content != target) {
+            cf_zone_api('/dns_records/' + rec.id, 'PATCH', {
+                type: 'CNAME',
+                name: hostname,
+                content: target,
+                proxied: true
+            });
+        }
+    } else {
+        cf_zone_api('/dns_records', 'POST', {
+            type: 'CNAME',
+            name: hostname,
+            content: target,
+            proxied: true,
+            comment: 'Created by OpenWrt Cloudflare Tunnel Manager'
+        });
+    }
+}
+
+// -------------------------------------------------------------
+// Core Methods
+// -------------------------------------------------------------
+
+function handle_getTunnels() {
+    cursor.load('cloudflared');
+    let running = is_service_running();
+    let local_sections = [];
+    let all = cursor.get_all('cloudflared') || {};
+    for (let sname, s in all) {
+        if (s['.type'] == 'tunnel') {
+            push(local_sections, {
+                name: s.name || sname,
+                id: s.id,
+                account_id: s.account_id,
+                token: s.token,
+                active: s.active == '1',
+                created_at: s.created_at || ''
+            });
+        }
+    }
+
+    let current_decoded = decode_token(current_token);
+    let active_id = active_tunnel_id;
+    if (!active_id && current_decoded && current_decoded.t) {
+        active_id = current_decoded.t;
+    }
+
+    let cf_res = cf_api('/cfd_tunnel?is_deleted=false', 'GET', null);
+    let tunnels = [];
+
+    if (cf_res && cf_res.success && cf_res.result) {
+        for (let t in cf_res.result) {
+            let is_active = (t.id == active_id);
+            let item = {
+                id: t.id,
+                name: t.name,
+                status: t.status,
+                created_at: t.created_at,
+                is_active: is_active,
+                is_running: is_active && running,
+                connections: t.connections || [],
+                ingress: [],
+                warp_routing: false,
+                token: ''
+            };
+
+            for (let ls in local_sections) {
+                if (ls.id == t.id && ls.token) {
+                    item.token = ls.token;
+                    break;
+                }
+            }
+            if (!item.token && is_active) {
+                item.token = current_token;
+            }
+
+            let cfg_res = cf_api('/cfd_tunnel/' + t.id + '/configurations', 'GET', null);
+            if (cfg_res && cfg_res.success && cfg_res.result && cfg_res.result.config) {
+                let conf = cfg_res.result.config;
+                if (conf.ingress) {
+                    for (let rule in conf.ingress) {
+                        if (rule.hostname) {
+                            let sec_key = replace('dis_' + t.id + '_' + rule.hostname, /[^a-zA-Z0-9_]/g, '_');
+                            let dis_entry = all[sec_key];
+                            let is_enabled = true;
+                            let eff_service = rule.service;
+
+                            if (dis_entry && dis_entry.target_service) {
+                                is_enabled = false;
+                                eff_service = dis_entry.target_service;
+                            } else if (rule.service == "http_status:503") {
+                                is_enabled = false;
+                            }
+
+                            push(item.ingress, {
+                                hostname: rule.hostname,
+                                service: eff_service,
+                                is_enabled: is_enabled,
+                                originRequest: rule.originRequest || {}
+                            });
+                        }
+                    }
+                }
+                if (conf['warp-routing'] && conf['warp-routing'].enabled) {
+                    item.warp_routing = true;
+                }
+            }
+
+            push(tunnels, item);
+        }
+    } else {
+        let recent_conns = get_recent_connections();
+        if (length(local_sections) == 0 && current_decoded) {
+            push(local_sections, {
+                name: 'Local Tunnel',
+                id: current_decoded.t || '',
+                account_id: current_decoded.a || '',
+                token: current_token,
+                active: true,
+                created_at: ''
+            });
+        }
+        for (let ls in local_sections) {
+            let is_active = (ls.id == active_id || ls.active);
+            push(tunnels, {
+                id: ls.id,
+                name: ls.name,
+                status: is_active && running ? 'healthy' : 'inactive',
+                created_at: ls.created_at,
+                is_active: is_active,
+                is_running: is_active && running,
+                connections: is_active ? recent_conns : [],
+                ingress: [],
+                warp_routing: false,
+                token: ls.token
+            });
+        }
+    }
+
+    return {
+        service_running: running,
+        active_tunnel_id: active_id,
+        account_id: account_id,
+        tunnels: tunnels,
+        has_api: (cf_res && cf_res.success) ? true : false
+    };
+}
+
+function handle_startTunnel() {
+    cursor.load('cloudflared');
+    cursor.set('cloudflared', 'config', 'enabled', '1');
+    cursor.commit('cloudflared');
+    run_cmd("/etc/init.d/cloudflared start");
+    return { success: true };
+}
+
+function handle_stopTunnel() {
+    cursor.load('cloudflared');
+    cursor.set('cloudflared', 'config', 'enabled', '0');
+    cursor.commit('cloudflared');
+    run_cmd("/etc/init.d/cloudflared stop");
+    return { success: true };
+}
+
+function handle_restartTunnel() {
+    cursor.load('cloudflared');
+    cursor.set('cloudflared', 'config', 'enabled', '1');
+    cursor.commit('cloudflared');
+    run_cmd("/etc/init.d/cloudflared restart");
+    return { success: true };
+}
+
+function handle_activateTunnel(input) {
+    let id = input ? input.id : null;
+    let tok = input ? input.token : null;
+    if (!id && !tok) return { success: false, error: "Missing tunnel ID or token" };
+
+    cursor.load('cloudflared');
+    if (!tok && id && api_token && account_id) {
+        let tok_res = cf_api('/cfd_tunnel/' + id + '/token', 'GET', null);
+        if (tok_res && tok_res.success && tok_res.result) {
+            tok = tok_res.result;
+        }
+    }
+
+    let all = cursor.get_all('cloudflared') || {};
+    if (!tok) {
+        for (let sname, s in all) {
+            if (s['.type'] == 'tunnel' && s.id == id && s.token) {
+                tok = s.token;
+                break;
+            }
+        }
+    }
+
+    if (!tok) return { success: false, error: "Tunnel token could not be resolved" };
+
+    let decoded = decode_token(tok);
+    let tun_id = id || (decoded ? decoded.t : '');
+
+    cursor.set('cloudflared', 'config', 'token', tok);
+    cursor.set('cloudflared', 'config', 'active_tunnel', tun_id);
+    cursor.set('cloudflared', 'config', 'enabled', '1');
+
+    for (let sname, s in all) {
+        if (s['.type'] == 'tunnel') {
+            cursor.set('cloudflared', sname, 'active', (s.id == tun_id ? '1' : '0'));
+        }
+    }
+
+    cursor.commit('cloudflared');
+    run_cmd("/etc/init.d/cloudflared restart");
+    return { success: true, active_id: tun_id };
+}
+
+function handle_createTunnel(input) {
+    if (!input || !input.name) return { success: false, error: "Name is required" };
+    let name = trim(input.name);
+    let subdomain = input.subdomain ? trim(input.subdomain) : null;
+    let service = input.service ? trim(input.service) : null;
+    let activate = input.activate ? true : false;
+
+    if (!api_token || !account_id) {
+        return { success: false, error: "Cloudflare API token or Account ID missing in configuration" };
+    }
+
+    let cf_create = cf_api('/cfd_tunnel', 'POST', {
+        name: name,
+        config_src: 'cloudflare'
+    });
+
+    if (!cf_create || !cf_create.success) {
+        let err_msg = "Failed to create tunnel";
+        if (cf_create && cf_create.errors && length(cf_create.errors) > 0) {
+            err_msg = cf_create.errors[0].message;
+        }
+        return { success: false, error: err_msg };
+    }
+
+    let new_id = cf_create.result.id;
+    let tok_res = cf_api('/cfd_tunnel/' + new_id + '/token', 'GET', null);
+    let new_token = (tok_res && tok_res.success) ? tok_res.result : '';
+
+    if (subdomain && service) {
+        cf_api('/cfd_tunnel/' + new_id + '/configurations', 'PUT', {
+            config: {
+                ingress: [
+                    { hostname: subdomain, service: service },
+                    { service: "http_status:404" }
+                ],
+                "warp-routing": { enabled: true }
+            }
+        });
+        create_or_update_dns_cname(subdomain, new_id);
+    }
+
+    cursor.load('cloudflared');
+    let sec_name = replace(name, /[^a-zA-Z0-9_]/g, '_');
+    cursor.set('cloudflared', sec_name, 'tunnel');
+    cursor.set('cloudflared', sec_name, 'name', name);
+    cursor.set('cloudflared', sec_name, 'id', new_id);
+    cursor.set('cloudflared', sec_name, 'account_id', account_id);
+    cursor.set('cloudflared', sec_name, 'token', new_token);
+    cursor.set('cloudflared', sec_name, 'created_at', cf_create.result.created_at || '');
+
+    if (activate) {
+        cursor.set('cloudflared', 'config', 'token', new_token);
+        cursor.set('cloudflared', 'config', 'active_tunnel', new_id);
+        cursor.set('cloudflared', 'config', 'enabled', '1');
+        let all = cursor.get_all('cloudflared') || {};
+        for (let sname, s in all) {
+            if (s['.type'] == 'tunnel') {
+                cursor.set('cloudflared', sname, 'active', (sname == sec_name ? '1' : '0'));
+            }
+        }
+        cursor.commit('cloudflared');
+        run_cmd("/etc/init.d/cloudflared restart");
+    } else {
+        cursor.set('cloudflared', sec_name, 'active', '0');
+        cursor.commit('cloudflared');
+    }
+
+    return {
+        success: true,
+        id: new_id,
+        name: name,
+        token: new_token,
+        activated: activate
+    };
+}
+
+function handle_addExistingTunnel(input) {
+    if (!input || !input.name || !input.token) {
+        return { success: false, error: "Name and Token are required" };
+    }
+    let name = trim(input.name);
+    let tok = trim(input.token);
+    let activate = input.activate ? true : false;
+
+    let decoded = decode_token(tok);
+    if (!decoded || !decoded.t) {
+        return { success: false, error: "Invalid Cloudflare Tunnel token format" };
+    }
+
+    cursor.load('cloudflared');
+    let sec_name = replace(name, /[^a-zA-Z0-9_]/g, '_');
+    cursor.set('cloudflared', sec_name, 'tunnel');
+    cursor.set('cloudflared', sec_name, 'name', name);
+    cursor.set('cloudflared', sec_name, 'id', decoded.t);
+    cursor.set('cloudflared', sec_name, 'account_id', decoded.a || account_id);
+    cursor.set('cloudflared', sec_name, 'token', tok);
+    cursor.set('cloudflared', sec_name, 'created_at', sprintf('%d', time()));
+
+    if (activate) {
+        cursor.set('cloudflared', 'config', 'token', tok);
+        cursor.set('cloudflared', 'config', 'active_tunnel', decoded.t);
+        cursor.set('cloudflared', 'config', 'enabled', '1');
+        let all = cursor.get_all('cloudflared') || {};
+        for (let sname, s in all) {
+            if (s['.type'] == 'tunnel') {
+                cursor.set('cloudflared', sname, 'active', (sname == sec_name ? '1' : '0'));
+            }
+        }
+        cursor.commit('cloudflared');
+        run_cmd("/etc/init.d/cloudflared restart");
+    } else {
+        cursor.set('cloudflared', sec_name, 'active', '0');
+        cursor.commit('cloudflared');
+    }
+
+    return { success: true, id: decoded.t, name: name };
+}
+
+function handle_editTunnel(input) {
+    if (!input || !input.id) return { success: false, error: "Tunnel ID is required" };
+    let id = input.id;
+    let new_name = input.name ? trim(input.name) : null;
+    let warp_routing = input.warp_routing ? true : false;
+
+    if (new_name && api_token && account_id) {
+        cf_api('/cfd_tunnel/' + id, 'PATCH', { name: new_name });
+    }
+
+    if (api_token && account_id) {
+        let cfg_res = cf_api('/cfd_tunnel/' + id + '/configurations', 'GET', null);
+        if (cfg_res && cfg_res.success && cfg_res.result && cfg_res.result.config) {
+            let conf = cfg_res.result.config;
+            conf['warp-routing'] = { enabled: warp_routing };
+            cf_api('/cfd_tunnel/' + id + '/configurations', 'PUT', { config: conf });
+        }
+    }
+
+    cursor.load('cloudflared');
+    let all = cursor.get_all('cloudflared') || {};
+    for (let sname, s in all) {
+        if (s['.type'] == 'tunnel' && s.id == id) {
+            if (new_name) cursor.set('cloudflared', sname, 'name', new_name);
+            break;
+        }
+    }
+    cursor.commit('cloudflared');
+
+    return { success: true };
+}
+
+function handle_deleteTunnel(input) {
+    if (!input || !input.id) return { success: false, error: "Tunnel ID is required" };
+    let id = input.id;
+    let delete_cloud = input.delete_cloud ? true : false;
+
+    cursor.load('cloudflared');
+    let was_active = (cursor.get('cloudflared', 'config', 'active_tunnel') == id);
+
+    let all = cursor.get_all('cloudflared') || {};
+    for (let sname, s in all) {
+        if (s['.type'] == 'tunnel' && s.id == id) {
+            cursor.delete('cloudflared', sname);
+        }
+    }
+
+    if (was_active) {
+        cursor.set('cloudflared', 'config', 'token', '');
+        cursor.set('cloudflared', 'config', 'active_tunnel', '');
+        cursor.set('cloudflared', 'config', 'enabled', '0');
+        run_cmd("/etc/init.d/cloudflared stop");
+    }
+
+    cursor.commit('cloudflared');
+
+    if (delete_cloud && api_token && account_id) {
+        cf_api('/cfd_tunnel/' + id, 'DELETE', null);
+    }
+
+    return { success: true };
+}
+
+function handle_addIngressRule(input) {
+    if (!input || !input.tunnel_id || !input.hostname || !input.service) {
+        return { success: false, error: "tunnel_id, hostname, and service are required" };
+    }
+    let tun_id = input.tunnel_id;
+    let hostname = trim(input.hostname);
+    let service = trim(input.service);
+
+    if (!api_token || !account_id) {
+        return { success: false, error: "Cloudflare API token not configured" };
+    }
+
+    let cfg_res = cf_api('/cfd_tunnel/' + tun_id + '/configurations', 'GET', null);
+    if (!cfg_res || !cfg_res.success || !cfg_res.result || !cfg_res.result.config) {
+        return { success: false, error: "Could not fetch existing configurations" };
+    }
+
+    let conf = cfg_res.result.config;
+    let ingress = conf.ingress || [];
+    let new_ingress = [];
+
+    let catch_all = null;
+    for (let rule in ingress) {
+        if (!rule.hostname) {
+            catch_all = rule;
+        } else if (rule.hostname != hostname) {
+            push(new_ingress, rule);
+        }
+    }
+
+    let rule_obj = { hostname: hostname, service: service };
+    let origin_req = {};
+    if (input.no_tls_verify) origin_req.noTLSVerify = true;
+    if (input.http_host_header) origin_req.httpHostHeader = trim(input.http_host_header);
+    if (origin_req.noTLSVerify || origin_req.httpHostHeader) {
+        rule_obj.originRequest = origin_req;
+    }
+
+    push(new_ingress, rule_obj);
+    if (catch_all) {
+        push(new_ingress, catch_all);
+    } else {
+        push(new_ingress, { service: "http_status:404" });
+    }
+
+    conf.ingress = new_ingress;
+
+    let put_res = cf_api('/cfd_tunnel/' + tun_id + '/configurations', 'PUT', { config: conf });
+    if (!put_res || !put_res.success) {
+        return { success: false, error: "Failed to update tunnel ingress rules" };
+    }
+
+    create_or_update_dns_cname(hostname, tun_id);
+
+    return { success: true };
+}
+
+function handle_editIngressRule(input) {
+    if (!input || !input.tunnel_id || !input.old_hostname || !input.service) {
+        return { success: false, error: "tunnel_id, old_hostname, and service are required" };
+    }
+    let tun_id = input.tunnel_id;
+    let old_h = trim(input.old_hostname);
+    let new_h = input.new_hostname ? trim(input.new_hostname) : old_h;
+    let s = trim(input.service);
+
+    if (!api_token || !account_id) return { success: false, error: "Cloudflare API token not configured" };
+
+    let cfg_res = cf_api('/cfd_tunnel/' + tun_id + '/configurations', 'GET', null);
+    if (!cfg_res || !cfg_res.success || !cfg_res.result || !cfg_res.result.config) {
+        return { success: false, error: "Could not fetch existing configurations" };
+    }
+
+    let conf = cfg_res.result.config;
+    let ingress = conf.ingress || [];
+    let new_ingress = [];
+    let catch_all = null;
+
+    for (let rule in ingress) {
+        if (!rule.hostname) {
+            catch_all = rule;
+        } else if (rule.hostname != old_h) {
+            push(new_ingress, rule);
+        }
+    }
+
+    let rule_obj = { hostname: new_h, service: s };
+    let origin_req = {};
+    if (input.no_tls_verify) origin_req.noTLSVerify = true;
+    if (input.http_host_header) origin_req.httpHostHeader = trim(input.http_host_header);
+    if (origin_req.noTLSVerify || origin_req.httpHostHeader) {
+        rule_obj.originRequest = origin_req;
+    }
+
+    push(new_ingress, rule_obj);
+    if (catch_all) push(new_ingress, catch_all);
+    else push(new_ingress, { service: "http_status:404" });
+
+    conf.ingress = new_ingress;
+
+    let put_res = cf_api('/cfd_tunnel/' + tun_id + '/configurations', 'PUT', { config: conf });
+    if (!put_res || !put_res.success) {
+        return { success: false, error: "Failed to update configurations in Cloudflare" };
+    }
+
+    if (old_h != new_h) {
+        delete_dns_cname(old_h);
+        create_or_update_dns_cname(new_h, tun_id);
+    } else {
+        create_or_update_dns_cname(new_h, tun_id);
+    }
+
+    // Clean up any disabled_route if renamed
+    cursor.load('cloudflared');
+    let old_sec = replace('dis_' + tun_id + '_' + old_h, /[^a-zA-Z0-9_]/g, '_');
+    cursor.delete('cloudflared', old_sec);
+    cursor.commit('cloudflared');
+
+    return { success: true };
+}
+
+function handle_deleteIngressRule(input) {
+    if (!input || !input.tunnel_id || !input.hostname) {
+        return { success: false, error: "tunnel_id and hostname are required" };
+    }
+    let tun_id = input.tunnel_id;
+    let h = trim(input.hostname);
+
+    if (!api_token || !account_id) return { success: false, error: "Cloudflare API token not configured" };
+
+    let cfg_res = cf_api('/cfd_tunnel/' + tun_id + '/configurations', 'GET', null);
+    if (!cfg_res || !cfg_res.success || !cfg_res.result || !cfg_res.result.config) {
+        return { success: false, error: "Could not fetch existing configurations" };
+    }
+
+    let conf = cfg_res.result.config;
+    let ingress = conf.ingress || [];
+    let new_ingress = [];
+    let catch_all = null;
+
+    for (let rule in ingress) {
+        if (!rule.hostname) {
+            catch_all = rule;
+        } else if (rule.hostname != h) {
+            push(new_ingress, rule);
+        }
+    }
+    if (catch_all) push(new_ingress, catch_all);
+    else push(new_ingress, { service: "http_status:404" });
+
+    conf.ingress = new_ingress;
+    let put_res = cf_api('/cfd_tunnel/' + tun_id + '/configurations', 'PUT', { config: conf });
+    if (!put_res || !put_res.success) {
+        return { success: false, error: "Failed to delete route in Cloudflare" };
+    }
+
+    delete_dns_cname(h);
+
+    // Clean up disabled entry if exists
+    cursor.load('cloudflared');
+    let dis_sec = replace('dis_' + tun_id + '_' + h, /[^a-zA-Z0-9_]/g, '_');
+    cursor.delete('cloudflared', dis_sec);
+    cursor.commit('cloudflared');
+
+    return { success: true };
+}
+
+function handle_toggleIngressRule(input) {
+    if (!input || !input.tunnel_id || !input.hostname) {
+        return { success: false, error: "tunnel_id and hostname are required" };
+    }
+    let tun_id = input.tunnel_id;
+    let h = trim(input.hostname);
+    let to_enable = input.enable ? true : false;
+
+    if (!api_token || !account_id) return { success: false, error: "Cloudflare API token not configured" };
+
+    let cfg_res = cf_api('/cfd_tunnel/' + tun_id + '/configurations', 'GET', null);
+    if (!cfg_res || !cfg_res.success || !cfg_res.result || !cfg_res.result.config) {
+        return { success: false, error: "Could not fetch existing configurations" };
+    }
+
+    let conf = cfg_res.result.config;
+    let ingress = conf.ingress || [];
+    let matched_rule = null;
+
+    for (let rule in ingress) {
+        if (rule.hostname == h) {
+            matched_rule = rule;
+            break;
+        }
+    }
+
+    if (!matched_rule) {
+        return { success: false, error: "Route not found in tunnel ingress configuration" };
+    }
+
+    cursor.load('cloudflared');
+    let sec_name = replace('dis_' + tun_id + '_' + h, /[^a-zA-Z0-9_]/g, '_');
+
+    if (to_enable) {
+        let target = cursor.get('cloudflared', sec_name, 'target_service');
+        if (!target || target == "http_status:503") {
+            let lan_ip = cursor.get("network", "lan", "ipaddr") || "192.168.1.1"; target = "http://" + lan_ip + ":80";
+        }
+        matched_rule.service = target;
+        cursor.delete('cloudflared', sec_name);
+        cursor.commit('cloudflared');
+    } else {
+        let current_svc = matched_rule.service;
+        if (current_svc != "http_status:503") {
+            cursor.set('cloudflared', sec_name, 'disabled_route');
+            cursor.set('cloudflared', sec_name, 'tunnel_id', tun_id);
+            cursor.set('cloudflared', sec_name, 'hostname', h);
+            cursor.set('cloudflared', sec_name, 'target_service', current_svc);
+            cursor.commit('cloudflared');
+        }
+        matched_rule.service = "http_status:503";
+    }
+
+    let put_res = cf_api('/cfd_tunnel/' + tun_id + '/configurations', 'PUT', { config: conf });
+    if (!put_res || !put_res.success) {
+        return { success: false, error: "Failed to update configurations in Cloudflare" };
+    }
+
+    return {
+        success: true,
+        is_enabled: to_enable,
+        service: matched_rule.service
+    };
+}
+
+function handle_getTunnelLogs(input) {
+    let lines = (input && input.lines) ? input.lines : 80;
+    let out = run_cmd("tail -n " + lines + " /var/log/cloudflared.log 2>/dev/null");
+    return { logs: out || "Log file is empty or not created yet." };
+}
+
+function handle_testRouteReachability(input) {
+    if (!input) return { error: "Missing input" };
+    let hostname = input.hostname ? trim(input.hostname) : "";
+    let service = input.service ? trim(input.service) : "";
+
+    let local_res = { reachable: false, status_code: "N/A", latency_ms: 0 };
+    if (service && service != "http_status:503" && service != "http_status:404") {
+        let cmd = "curl -s -m 3 -o /dev/null -w '%{http_code}:%{time_total}' '" + replace(service, "'", "'\\''") + "' 2>/dev/null";
+        let out = trim(run_cmd(cmd));
+        let parts = split(out, ':');
+        let code = parts[0];
+        let lat = (length(parts) > 1 && +parts[1]) ? sprintf('%.0f', +parts[1] * 1000) : 0;
+        let ok = (code != "" && code != "000");
+        local_res = {
+            reachable: ok,
+            status_code: ok ? code : "TIMEOUT",
+            latency_ms: lat
+        };
+    }
+
+    let public_res = { reachable: false, status_code: "N/A", edge_ip: "", latency_ms: 0 };
+    if (hostname) {
+        let pub_url = "https://" + hostname;
+        let cmd = "curl -s -m 5 -o /dev/null -w '%{http_code}:%{time_total}:%{remote_ip}' '" + replace(pub_url, "'", "'\\''") + "' 2>/dev/null";
+        let out = trim(run_cmd(cmd));
+        let parts = split(out, ':');
+        let code = parts[0];
+        let lat = (length(parts) > 1 && +parts[1]) ? sprintf('%.0f', +parts[1] * 1000) : 0;
+        let ip = length(parts) > 2 ? parts[2] : "";
+        let ok = (code != "" && code != "000");
+        public_res = {
+            reachable: ok,
+            status_code: ok ? code : "TIMEOUT",
+            edge_ip: ip,
+            latency_ms: lat
+        };
+    }
+
+    return {
+        local: local_res,
+        public: public_res
+    };
+}
+
+// -------------------------------------------------------------
+// RPCD CLI Dispatcher
+// -------------------------------------------------------------
+
+if (action == 'list') {
+    print(sprintf('%J\n', {
+        getTunnels: {},
+        startTunnel: {},
+        stopTunnel: {},
+        restartTunnel: {},
+        activateTunnel: { id: "str", token: "str" },
+        createTunnel: { name: "str", subdomain: "str", service: "str", activate: "bool" },
+        addExistingTunnel: { name: "str", token: "str", activate: "bool" },
+        editTunnel: { id: "str", name: "str", warp_routing: "bool" },
+        deleteTunnel: { id: "str", delete_cloud: "bool" },
+        addIngressRule: { tunnel_id: "str", hostname: "str", service: "str", no_tls_verify: "bool", http_host_header: "str" },
+        editIngressRule: { tunnel_id: "str", old_hostname: "str", new_hostname: "str", service: "str", no_tls_verify: "bool", http_host_header: "str" },
+        deleteIngressRule: { tunnel_id: "str", hostname: "str" },
+        toggleIngressRule: { tunnel_id: "str", hostname: "str", enable: "bool" },
+        getTunnelLogs: { lines: "int" },
+        testRouteReachability: { hostname: "str", service: "str" }
+    }));
+    exit(0);
+}
+
+if (action == 'call') {
+    let input = json(fs.readfile('/dev/stdin')) || {};
+    let result = null;
+
+    if (method == 'getTunnels') result = handle_getTunnels();
+    else if (method == 'startTunnel') result = handle_startTunnel();
+    else if (method == 'stopTunnel') result = handle_stopTunnel();
+    else if (method == 'restartTunnel') result = handle_restartTunnel();
+    else if (method == 'activateTunnel') result = handle_activateTunnel(input);
+    else if (method == 'createTunnel') result = handle_createTunnel(input);
+    else if (method == 'addExistingTunnel') result = handle_addExistingTunnel(input);
+    else if (method == 'editTunnel') result = handle_editTunnel(input);
+    else if (method == 'deleteTunnel') result = handle_deleteTunnel(input);
+    else if (method == 'addIngressRule') result = handle_addIngressRule(input);
+    else if (method == 'editIngressRule') result = handle_editIngressRule(input);
+    else if (method == 'deleteIngressRule') result = handle_deleteIngressRule(input);
+    else if (method == 'toggleIngressRule') result = handle_toggleIngressRule(input);
+    else if (method == 'getTunnelLogs') result = handle_getTunnelLogs(input);
+    else if (method == 'testRouteReachability') result = handle_testRouteReachability(input);
+    else {
+        print(sprintf('%J\n', { error: "Method not found" }));
+        exit(1);
+    }
+
+    print(sprintf('%J\n', result));
+    exit(0);
+}
+
+exit(1);
